@@ -1,0 +1,116 @@
+<?php
+
+namespace App\Commands;
+
+use App\Models\SettingModel;
+use App\Services\DailyClosingService;
+use App\Services\PosCashService;
+use App\Services\PosReturnService;
+use App\Services\PosSaleService;
+use App\Services\PosSalesReportService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY: metode bayar Transfer (Bank Utama). Hanya di DB *_training. */
+class TransferSmokeTest extends BaseCommand
+{
+    protected $group = 'pos';
+    protected $name  = 'pos:transfer-smoke';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db = db_connect();
+        if (! str_ends_with((string) $db->getDatabase(), '_training')) {
+            CLI::error('Hanya boleh di database latihan.');
+
+            return;
+        }
+        $set  = new SettingModel();
+        $bank = (int) $db->table('cash_accounts')->where('name', 'Bank Utama')->get()->getRow('id');
+        $this->check('Setting pos_transfer_account = Bank Utama', (int) $set->value('pos_transfer_account', '0') === $bank && $bank > 0, [$set->value('pos_transfer_account', '0'), $bank]);
+        $kas  = (int) $set->value('pos_cash_account', '0');
+        $bal  = static fn (int $acc) => (float) db_connect()->query("SELECT COALESCE(SUM(CASE WHEN type='INCOME' THEN amount ELSE -amount END),0) s FROM financial_transactions WHERE cash_account_id = ?", [$acc])->getRow('s');
+        $A    = (int) $db->table('products')->where('product_code', 'LTH-001')->get()->getRow('id'); // Beras 72.000
+        $uid  = (int) $db->table('users')->where('username', 'latihan.kasir')->get()->getRow('id');
+        $spv  = (int) $db->table('users')->where('username', 'latihan.spv')->get()->getRow('id');
+        $kasir = ['user_id' => $uid, 'can_override' => false, 'can_discount' => false];
+        $uuid  = static fn () => sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+        $sale  = new PosSaleService(); $day = new DailyClosingService();
+        $day->open(100000, $uid);
+        $b0 = $bal($bank); $k0 = $bal($kas);
+
+        // 1) Checkout transfer: menunggu verifikasi, belum ada uang masuk
+        $r = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'TRANSFER', 'reference_no' => 'Budi']]], $kasir);
+        $this->check('Checkout TRANSFER sukses (menunggu verifikasi)', $r['success'] && $r['payment_status'] === 'PENDING_VERIFICATION', $r['message'] ?? '');
+        $p = $db->table('pos_payments')->where('sale_id', $r['id'])->get()->getRowArray();
+        $this->check('Pembayaran tersimpan method TRANSFER, akun = Bank Utama, status pending', $p['method'] === 'TRANSFER' && (int) $p['cash_account_id'] === $bank && $p['status'] === 'PENDING_VERIFICATION', $p);
+        $this->check('Belum ada uang masuk Bank/Kas', $bal($bank) == $b0 && $bal($kas) == $k0);
+        $sum = $day->summary($day->openDay());
+        $this->check('EOD: Transfer pending terhitung sebagai belum diverifikasi (1 trx, 72.000)', $sum['qris_pending_count'] === 1 && $sum['qris_pending'] == 72000.0, [$sum['qris_pending_count'], $sum['qris_pending']]);
+
+        // 2) Verifikasi: masuk Bank Utama, bukan Kas Kasir / QRIS Clearing
+        $v = $sale->verifyQris((int) $p['id'], true, $spv);
+        $this->check('Verifikasi transfer sukses', $v['success'], $v['message']);
+        $this->check('Bank Utama +72.000, Kas Kasir tetap', $bal($bank) == $b0 + 72000.0 && $bal($kas) == $k0, [$bal($bank) - $b0, $bal($kas) - $k0]);
+        $s = $db->table('pos_sales')->where('id', $r['id'])->get()->getRowArray();
+        $this->check('Penjualan lunas (PAID)', $s['payment_status'] === 'PAID' && (float) $s['paid_total'] == 72000.0);
+        $this->check('Verifikasi ulang ditolak', ! $sale->verifyQris((int) $p['id'], true, $spv)['success']);
+        $ft = $db->table('financial_transactions')->where('id', $p['financial_transaction_id'] ?: (int) $db->table('pos_payments')->where('id', $p['id'])->get()->getRow('financial_transaction_id'))->get()->getRowArray();
+        $this->check('Keterangan transaksi keuangan menyebut Transfer', str_contains((string) $ft['description'], 'Transfer'), $ft['description'] ?? '');
+
+        // 3) Tidak muncul di settlement QRIS
+        $this->check('Transfer tidak masuk daftar settlement QRIS', count(array_filter((new PosCashService())->unsettledQris(), static fn ($x) => (int) ($x['payment_id'] ?? $x['id'] ?? 0) === (int) $p['id'])) === 0);
+
+        // 4) Ditolak
+        $r2 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'TRANSFER']]], $kasir);
+        $p2 = $db->table('pos_payments')->where('sale_id', $r2['id'])->get()->getRowArray();
+        $x  = $sale->verifyQris((int) $p2['id'], false, $spv);
+        $this->check('Tolak transfer: status REJECTED, tidak ada uang masuk', $x['success'] && $db->table('pos_payments')->where('id', $p2['id'])->get()->getRow('status') === 'REJECTED' && $bal($bank) == $b0 + 72000.0);
+
+        // 5) Pelunasan via transfer
+        $r3 = $sale->checkout(['client_uuid' => $uuid(), 'customer_id' => (int) $db->table('accounts')->get(1)->getRow('id') ?: null, 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 20000]]], $kasir);
+        if (! $r3['success']) {
+            // butuh pelanggan: buat satu
+            $db->table('accounts')->insert(['nama_account' => 'Pelanggan Uji', 'status' => 'aktif', 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]);
+            $cid = (int) $db->insertID();
+            $r3  = $sale->checkout(['client_uuid' => $uuid(), 'customer_id' => $cid, 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 20000]]], $kasir);
+        }
+        $this->check('Penjualan dengan sisa tagihan (bayar 20.000 dari 72.000)', $r3['success'] && (float) $r3['balance_due'] == 52000.0, $r3['message'] ?? '');
+        $pay = $sale->addPayment($r3['id'], $uuid(), 'TRANSFER', 52000, 'Pelunasan', $uid);
+        $this->check('Pelunasan transfer tercatat menunggu verifikasi', $pay['success'] && $pay['payment_status'] === 'PENDING_VERIFICATION', $pay['message']);
+        $pid3 = (int) $db->table('pos_payments')->where('sale_id', $r3['id'])->where('method', 'TRANSFER')->get()->getRow('id');
+        $sale->verifyQris($pid3, true, $spv);
+        $this->check('Setelah verifikasi lunas, Bank Utama +52.000', $db->table('pos_sales')->where('id', $r3['id'])->get()->getRow('payment_status') === 'PAID' && $bal($bank) == $b0 + 72000.0 + 52000.0, $bal($bank) - $b0);
+
+        // 6) Koreksi metode: Tunai -> Transfer, dana berpindah Kas Kasir -> Bank Utama
+        $cashPay = (int) $db->table('pos_payments')->where('sale_id', $r3['id'])->where('method', 'CASH')->get()->getRow('id');
+        $kBefore = $bal($kas); $bBefore = $bal($bank);
+        $c = (new PosReturnService())->correctPayment($cashPay, 'TRANSFER', 'Pelanggan ternyata transfer', $spv);
+        $this->check('Koreksi Tunai → Transfer', $c['success'], $c['message']);
+        $this->check('Dana pindah 20.000 dari Kas Kasir ke Bank Utama', $bal($kas) == $kBefore - 20000.0 && $bal($bank) == $bBefore + 20000.0, [$bal($kas) - $kBefore, $bal($bank) - $bBefore]);
+
+        // 7) Void transaksi transfer terkonfirmasi: refund dari Bank Utama
+        $bV = $bal($bank);
+        $vd = $sale->void($r['id'], 'Salah input', $spv);
+        $this->check('Void penjualan transfer: Bank Utama -72.000', $vd['success'] && $bal($bank) == $bV - 72000.0, $vd['message']);
+
+        // 8) Validasi metode & laporan
+        $bad = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'KARTU']]], $kasir);
+        $this->check('Metode tidak dikenal ditolak', ! $bad['success']);
+        $rep = (new PosSalesReportService())->build(date('Y-m-d'), date('Y-m-d'));
+        $d0  = $rep['daily'][0] ?? [];
+        $this->check('Laporan harian punya kolom transfer > 0', isset($d0['transfer']) && $d0['transfer'] > 0, $d0['transfer'] ?? null);
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

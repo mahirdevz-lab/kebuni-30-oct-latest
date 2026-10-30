@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title><?= isset($title) ? esc($title) . ' - ' : '' ?>Back Office Management System</title>
+
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/5.3.3/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet">
+    <link href="<?= base_url('assets/css/app.css') ?>?v=<?= filemtime(FCPATH . 'assets/css/app.css') ?>" rel="stylesheet">
+    <?= $this->renderSection('styles') ?>
+</head>
+<body>
+
+<?= $this->renderSection('content') ?>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/5.3.3/js/bootstrap.bundle.min.js"></script>
+<script>
+    const CSRF_TOKEN_NAME = "<?= csrf_token() ?>";
+    let CSRF_HASH = "<?= csrf_hash() ?>";
+    const BASE_URL = "<?= base_url() ?>";
+    $.ajaxSetup({ headers: { 'X-CSRF-TOKEN': CSRF_HASH } });
+</script>
+<?= $this->renderSection('scripts') ?>
+</body>
+</html>

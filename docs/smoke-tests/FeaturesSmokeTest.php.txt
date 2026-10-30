@@ -1,0 +1,171 @@
+<?php
+
+namespace App\Commands;
+
+use App\Models\SettingModel;
+use App\Services\DailyClosingService;
+use App\Services\PosCashService;
+use App\Services\PosDashboardService;
+use App\Services\PosExceptionService;
+use App\Services\PosReturnService;
+use App\Services\PosSaleService;
+use App\Services\PromoService;
+use App\Services\ReorderService;
+use App\Services\StockLedgerService;
+use App\Services\SupplierReturnService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY: fitur 2-8 (dashboard, pengecualian, bukti setoran, reorder, retur supplier, promo). Hanya di DB *_training. */
+class FeaturesSmokeTest extends BaseCommand
+{
+    protected $group = 'pos';
+    protected $name  = 'pos:features-smoke';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db = db_connect();
+        if (! str_ends_with((string) $db->getDatabase(), '_training')) {
+            CLI::error('Hanya boleh di database latihan.');
+
+            return;
+        }
+        $pid  = static fn (string $code) => (int) db_connect()->table('products')->where('product_code', $code)->get()->getRow('id');
+        $uid  = static fn (string $u) => (int) db_connect()->table('users')->where('username', $u)->get()->getRow('id');
+        $MIE  = $pid('LTH-005'); $KOPI = $pid('LTH-006'); $BERAS = $pid('LTH-001'); $SABUN = $pid('LTH-008');
+        $kasirId = $uid('latihan.kasir'); $spvId = $uid('latihan.spv');
+        $led = new StockLedgerService(); $loc = (new DailyClosingService())->locationId();
+        $qty = static fn (int $p) => (float) (new StockLedgerService())->balance($p, (new DailyClosingService())->locationId())['qty'];
+        $kasir = ['user_id' => $kasirId, 'can_override' => false, 'can_discount' => false];
+        $uuid = static fn () => sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+        $day = new DailyClosingService(); $sale = new PosSaleService(); $promo = new PromoService();
+        $ok = $day->open(100000, $kasirId);
+        $this->check('Buka toko', $ok['success'], $ok['message'] ?? '');
+
+        // ===== F7 PROMO =====
+        $from = date('Y-m-d H:i:s', strtotime('-1 hour')); $to = date('Y-m-d H:i:s', strtotime('+1 day'));
+        $r = $promo->create(['promo_type' => 'TIER', 'product_id' => $MIE, 'name' => 'Grosir Mie', 'min_qty' => 10, 'tier_price' => 3500, 'start_at' => $from, 'end_at' => $to], $spvId);
+        $this->check('TIER harga ≥ harga normal ditolak', ! $r['success'], $r['message']);
+        $r = $promo->create(['promo_type' => 'TIER', 'product_id' => $MIE, 'name' => 'Grosir Mie', 'min_qty' => 10, 'tier_price' => 3000, 'start_at' => $to, 'end_at' => $from], $spvId);
+        $this->check('Periode terbalik ditolak', ! $r['success']);
+        $r = $promo->create(['promo_type' => 'TIER', 'product_id' => $MIE, 'name' => 'Grosir Mie', 'min_qty' => 10, 'tier_price' => 3000, 'start_at' => $from, 'end_at' => $to], $spvId);
+        $this->check('TIER 10+ = Rp3.000 tersimpan', $r['success'], $r['message']);
+        $tierId = $r['id'] ?? 0;
+        $r2 = $promo->create(['promo_type' => 'TIER', 'product_id' => $MIE, 'name' => 'Dobel', 'min_qty' => 5, 'tier_price' => 3200, 'start_at' => $from, 'end_at' => $to], $spvId);
+        $this->check('Promo sejenis tumpang tindih ditolak', ! $r2['success'], $r2['message']);
+        $r = $promo->create(['promo_type' => 'BOGO', 'product_id' => $KOPI, 'name' => 'Kopi B2G1', 'buy_qty' => 2, 'get_qty' => 1, 'max_sets' => 3, 'start_at' => $from, 'end_at' => $to], $spvId);
+        $this->check('BOGO beli 2 gratis 1 (maks 3×) tersimpan', $r['success'], $r['message']);
+        $bogoId = $r['id'] ?? 0;
+        $r = $promo->create(['promo_type' => 'BOGO', 'product_id' => $SABUN, 'name' => 'Nanti', 'buy_qty' => 1, 'get_qty' => 1, 'start_at' => date('Y-m-d H:i:s', strtotime('+2 days')), 'end_at' => date('Y-m-d H:i:s', strtotime('+3 days'))], $spvId);
+        $this->check('Promo terjadwal masa depan tersimpan', $r['success']);
+
+        $ev = $promo->evaluate($promo->activeFor([$MIE])[$MIE] ?? null, 9, 3500);
+        $this->check('evaluate: qty 9 belum kena tier', $ev['unit_price'] == 3500.0 && $ev['price_promo_id'] === null);
+        $ev = $promo->evaluate($promo->activeFor([$MIE])[$MIE] ?? null, 10, 3500);
+        $this->check('evaluate: qty 10 → Rp3.000', $ev['unit_price'] == 3000.0 && $ev['price_promo_id'] === $tierId);
+        $ev = $promo->evaluate($promo->activeFor([$KOPI])[$KOPI] ?? null, 9, 2000);
+        $this->check('evaluate BOGO qty 9 → 4 set tapi maks 3 → gratis 3', $ev['free_qty'] == 3.0 && $ev['free_promo_id'] === $bogoId, $ev);
+        $this->check('Promo masa depan tidak aktif sekarang', empty($promo->activeFor([$SABUN])[$SABUN] ?? null));
+
+        $stM = $qty($MIE); $stK = $qty($KOPI);
+        $s = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $MIE, 'qty' => 12]], 'payments' => [['method' => 'CASH', 'tendered' => 40000]]], $kasir);
+        $this->check('Checkout 12 Mie: total 36.000 (harga tier)', $s['success'] && (float) $db->table('pos_sales')->where('id', $s['id'])->get()->getRow('grand_total') == 36000.0, $s['message'] ?? '');
+        $it = $db->table('pos_sale_items')->where('sale_id', $s['id'])->get()->getResultArray();
+        $this->check('Baris menyimpan promo_id tier & unit_price 3000', count($it) === 1 && (int) $it[0]['promo_id'] === $tierId && (float) $it[0]['unit_price'] == 3000.0 && (float) $it[0]['list_price'] == 3500.0, $it);
+        $this->check('Stok Mie berkurang 12', $qty($MIE) == $stM - 12);
+        $mieSale = $s;
+
+        $s = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $KOPI, 'qty' => 7]], 'payments' => [['method' => 'CASH', 'tendered' => 20000]]], $kasir);
+        $this->check('Checkout 7 Kopi: bayar 14.000 (gratis 3)', $s['success'] && (float) $db->table('pos_sales')->where('id', $s['id'])->get()->getRow('grand_total') == 14000.0, $s['message'] ?? '');
+        $it = $db->table('pos_sale_items')->where('sale_id', $s['id'])->orderBy('line_no')->get()->getResultArray();
+        $free = array_values(array_filter($it, fn ($x) => $x['line_type'] === 'PROMO_FREE'));
+        $this->check('Ada baris PROMO_FREE qty 3 harga 0 dengan promo_id BOGO', count($free) === 1 && (float) $free[0]['qty'] == 3.0 && (float) $free[0]['line_total'] == 0.0 && (int) $free[0]['promo_id'] === $bogoId, $free);
+        $this->check('Stok Kopi berkurang 10 (7 jual + 3 gratis)', $qty($KOPI) == $stK - 10, [$stK, $qty($KOPI)]);
+        $cogs = (float) $db->table('pos_sales')->where('id', $s['id'])->get()->getRow('cogs_total');
+        $this->check('HPP penjualan = 10 × 1.500 = 15.000', abs($cogs - 15000.0) < 0.5, $cogs);
+        $ledPF = (int) $db->table('stock_ledger')->where('movement_type', 'PROMO_FREE')->where('product_id', $KOPI)->countAllResults();
+        $this->check('Ledger PROMO_FREE tercatat', $ledPF === 1);
+
+        $rt = (new PosReturnService())->create($mieSale['id'], ['items' => [['sale_item_id' => (int) $db->table('pos_sale_items')->where('sale_id', $mieSale['id'])->get()->getRow('id'), 'qty' => 2, 'condition' => 'RESTOCK']], 'reason_code' => 'BATAL_BELI', 'refund_method' => 'CASH'], $kasirId);
+        $this->check('Retur 2 Mie: refund = harga tier dibayar 6.000', $rt['success'] && (float) $rt['refund'] == 6000.0, $rt['message'] ?? $rt);
+
+        $c = $promo->cancel($bogoId);
+        $this->check('Batalkan BOGO', $c['success'] && ! $promo->cancel($bogoId)['success']);
+        $s = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $KOPI, 'qty' => 4]], 'payments' => [['method' => 'CASH', 'tendered' => 8000]]], $kasir);
+        $this->check('Setelah batal: Kopi 4 = 8.000 tanpa gratis', $s['success'] && (float) $db->table('pos_sales')->where('id', $s['id'])->get()->getRow('grand_total') == 8000.0 && ! $db->table('pos_sale_items')->where('sale_id', $s['id'])->where('line_type', 'PROMO_FREE')->countAllResults());
+
+        // ===== Pengecualian: override, diskon, void =====
+        $db->table('users')->where('id', $spvId)->update(['pin_hash' => password_hash('4821', PASSWORD_DEFAULT), 'pin_failed' => 0]);
+        $ov = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $SABUN, 'qty' => 5]], 'payments' => [['method' => 'CASH', 'tendered' => 30000]], 'override_reason' => 'Barang baru datang belum diinput', 'supervisor' => ['id' => $spvId, 'pin' => '4821']], $kasir);
+        $this->check('Override stok dengan PIN supervisor lolos', $ov['success'], $ov['message'] ?? '');
+        $ds = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $BERAS, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 80000]], 'discount' => ['type' => 'PCT', 'value' => 10, 'reason' => 'Pelanggan lama'], 'supervisor' => ['id' => $spvId, 'pin' => '4821']], $kasir);
+        $this->check('Diskon 10% dengan PIN lolos', $ds['success'], $ds['message'] ?? '');
+        $vs = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $BERAS, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 80000]]], $kasir);
+        $vv = $sale->void($vs['id'], 'Salah input kasir', $spvId);
+        $this->check('Void', $vv['success'], $vv['message'] ?? '');
+        $ex = (new PosExceptionService())->build(date('Y-m-d'), date('Y-m-d'));
+        $this->check('Pengecualian: OVERRIDE=1 DISKON=1 VOID=1 RETUR=1', $ex['counts']['OVERRIDE'] === 1 && $ex['counts']['DISKON'] === 1 && $ex['counts']['VOID'] === 1 && $ex['counts']['RETUR'] === 1, $ex['counts']);
+        $ovRow = array_values(array_filter($ex['rows'], fn ($r) => $r['type'] === 'OVERRIDE'))[0] ?? [];
+        $this->check('Baris override memuat supervisor & kasir', ($ovRow['approver'] ?? '') === 'Supervisor Latihan' && ($ovRow['actor'] ?? '') === 'Kasir Latihan', $ovRow);
+        $filtered = (new PosExceptionService())->build(date('Y-m-d'), date('Y-m-d'), 'VOID');
+        $this->check('Filter jenis VOID hanya 1 baris', count($filtered['rows']) === 1);
+
+        // ===== F5 reorder =====
+        $ro = (new ReorderService())->build();
+        $byCode = array_column($ro['rows'], null, 'code');
+        $this->check('Sabun (stok minus/di bawah min) berstatus HABIS/KRITIS & disarankan dipesan', in_array($byCode['LTH-008']['status'], ['HABIS', 'KRITIS'], true) && $byCode['LTH-008']['suggested'] > 0, $byCode['LTH-008']);
+        $this->check('Mie punya rata-rata jual > 0 (penjualan 12 − retur 2)', $byCode['LTH-005']['avg_per_day'] > 0, $byCode['LTH-005']['avg_per_day']);
+        $this->check('Beras aman', $byCode['LTH-001']['status'] === 'AMAN', $byCode['LTH-001']['status']);
+        $this->check('Teks pesanan tidak kosong', (new ReorderService())->orderText($ro['rows']) !== '');
+
+        // ===== F6 retur supplier =====
+        $db->table('suppliers')->insert(['nama_supplier' => 'Supplier Latihan', 'status' => 'aktif', 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]);
+        $sup = (int) $db->insertID();
+        $sr = new SupplierReturnService();
+        $stB = $qty($BERAS);
+        $this->check('Tanpa alasan ditolak', ! $sr->create(['supplier_id' => $sup, 'items' => [['product_id' => $BERAS, 'qty' => 1]]], $spvId)['success']);
+        $this->check('Qty melebihi stok ditolak', ! $sr->create(['supplier_id' => $sup, 'reason_code' => 'RUSAK', 'items' => [['product_id' => $BERAS, 'qty' => 9999]]], $spvId)['success']);
+        $this->check('Produk dobel ditolak', ! $sr->create(['supplier_id' => $sup, 'reason_code' => 'RUSAK', 'items' => [['product_id' => $BERAS, 'qty' => 1], ['product_id' => $BERAS, 'qty' => 1]]], $spvId)['success']);
+        $x = $sr->create(['supplier_id' => $sup, 'reason_code' => 'RUSAK', 'reason' => 'Karung sobek', 'credit_amount' => 100000, 'settlement' => 'NOTA_KREDIT', 'items' => [['product_id' => $BERAS, 'qty' => 2]]], $spvId);
+        $this->check('Retur supplier 2 Beras berhasil', $x['success'], $x['message'] ?? '');
+        $this->check('Stok Beras turun 2', $qty($BERAS) == $stB - 2);
+        $row = $db->table('supplier_returns')->get()->getRowArray();
+        $this->check('Nilai biaya = 2 × 63.000 = 126.000, nomor RS-', abs((float) $row['cost_value'] - 126000.0) < 1 && str_starts_with($row['return_no'], 'RS-'), $row);
+        $this->check('Ledger SUPPLIER_RETURN ada', (int) $db->table('stock_ledger')->where('movement_type', 'SUPPLIER_RETURN')->where('product_id', $BERAS)->countAllResults() === 1);
+
+        // ===== F4 bukti setoran / QRIS =====
+        $bank = (int) $db->table('cash_accounts')->whereNotIn('id', [(int) (new SettingModel())->value('pos_cash_account'), (int) (new SettingModel())->value('pos_qris_account')])->get(1)->getRow('id');
+        $cash = new PosCashService();
+        $d = $cash->deposit(20000, $bank, 'REF-1', 'uji', $spvId, 'pos_proofs/uji_setoran.jpg');
+        $this->check('Setoran dengan bukti berhasil', $d['success'], $d['message'] ?? '');
+        $this->check('proof_path tersimpan di setoran', $db->table('pos_cash_deposits')->get()->getRow('proof_path') === 'pos_proofs/uji_setoran.jpg');
+        $q = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $BERAS, 'qty' => 1]], 'payments' => [['method' => 'QRIS', 'tendered' => 72000, 'reference_no' => 'Q1']]], $kasir);
+        $pay = (int) $db->table('pos_payments')->where('sale_id', $q['id'])->get()->getRow('id');
+        $sale->verifyQris($pay, true, $spvId);
+        $st = $cash->settleQris([$pay], 71500, date('Y-m-d'), 'ST-1', 'uji', $bank, $spvId, 'pos_proofs/uji_qris.pdf');
+        $this->check('Settlement QRIS dengan bukti berhasil', $st['success'], $st['message'] ?? '');
+        $this->check('proof_path tersimpan di settlement', $db->table('pos_qris_settlements')->get()->getRow('proof_path') === 'pos_proofs/uji_qris.pdf');
+
+        // ===== F2 dashboard =====
+        $dash = (new PosDashboardService())->build();
+        $posted = (int) $db->table('pos_sales')->where('status', 'POSTED')->countAllResults();
+        $this->check('Dashboard: jumlah transaksi sama dengan DB', $dash['sales']['count'] === $posted, [$dash['sales']['count'], $posted]);
+        $this->check('Dashboard: toko BUKA', ! empty($dash['day']));
+        $this->check('Dashboard: pengecualian total ≥ 4', $dash['exceptions_total'] >= 4, $dash['exceptions_total']);
+        $this->check('Dashboard: kas buku > 0 & tren 7 hari', $dash['cash_balance'] > 0 && count($dash['trend']) === 7, $dash['cash_balance']);
+        $sumGrand = (float) $db->query("SELECT SUM(grand_total) s FROM pos_sales WHERE status='POSTED'")->getRow('s');
+        $this->check('Dashboard: total penjualan hari ini = SUM grand_total', abs($dash['sales']['gross'] - $sumGrand) < 0.5 && abs($dash['sales']['total'] - ($sumGrand - 6000)) < 0.5, [$dash['sales']['gross'], $dash['sales']['total'], $sumGrand]);
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

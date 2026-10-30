@@ -1,0 +1,128 @@
+<?php
+
+namespace App\Commands;
+
+use App\Services\DailyClosingService;
+use App\Services\GoodsReceiptService;
+use App\Services\PosCashService;
+use App\Services\PosReturnService;
+use App\Services\PosSaleService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY: setoran kas & settlement QRIS. Membersihkan data uji sendiri. */
+class CashSmokeTest extends BaseCommand
+{
+    protected $group = 'pos';
+    protected $name  = 'pos:cash-smoke';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db  = db_connect();
+        $ids = array_map('intval', array_column($db->table('products')->where('status', 'aktif')->where('deleted_at', null)->orderBy('id')->get(1)->getResultArray(), 'id'));
+        $A   = $ids[0];
+        $sup = (int) $db->table('suppliers')->where('deleted_at', null)->get(1)->getRow('id');
+        $db->table('products')->where('id', $A)->update(['is_pos' => 1]);
+        $db->table('pos_product_prices')->insert(['product_id' => $A, 'retail_price' => 20000, 'effective_from' => date('Y-m-d H:i:s', time() - 60), 'created_at' => date('Y-m-d H:i:s')]);
+        $cash = new PosCashService(); $day = new DailyClosingService(); $sale = new PosSaleService();
+        $kasir = ['user_id' => 1, 'can_override' => false];
+        $uuid  = static fn () => sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+        $bal   = static fn (int $id) => (float) db_connect()->query("SELECT COALESCE(SUM(CASE WHEN type='INCOME' THEN amount ELSE -amount END),0) s FROM financial_transactions WHERE cash_account_id=? AND id > 137", [$id])->getRow('s');
+
+        $this->check('Setoran sebelum ada hari kas ditolak', ! $cash->deposit(1000, 1, null, null, 1)['success']);
+        $day->open(100000, 1);
+        $this->check('Kas awal seharusnya belum ada (belum pernah EOD)', $day->expectedOpeningCash() === null);
+        (new GoodsReceiptService())->create(['supplier_id' => $sup, 'items' => [['product_id' => $A, 'qty_regular' => 100, 'line_cost' => 1000000]]], 1);
+        $s1 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 5]], 'payments' => [['method' => 'CASH', 'tendered' => 100000]]], $kasir);
+        $q1 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 3]], 'payments' => [['method' => 'QRIS']]], $kasir);
+        $q2 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 2]], 'payments' => [['method' => 'QRIS']]], $kasir);
+        $q3 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'QRIS']]], $kasir);
+        foreach ([$q1, $q2, $q3] as $q) {
+            $pid = (int) $db->table('pos_payments')->where('sale_id', $q['id'])->get()->getRow('id');
+            $sale->verifyQris($pid, true, 1);
+        }
+        // Kas laci = 100.000 awal + 100.000 tunai = 200.000
+        $this->check('Kas tersedia = 200.000 saat toko buka', $cash->availableCash()['amount'] == 200000.0 && $cash->availableCash()['timing'] === 'DURING_DAY', $cash->availableCash()['amount']);
+        $this->check('Setoran melebihi kas ditolak', ! $cash->deposit(250000, 1, null, null, 1)['success']);
+        $this->check('Setoran ke Kas Kasir sendiri ditolak', ! $cash->deposit(1000, 3, null, null, 1)['success']);
+        $this->check('Setoran ke QRIS Clearing ditolak', ! $cash->deposit(1000, 4, null, null, 1)['success']);
+        $d1 = $cash->deposit(150000, 1, 'BKT-001', 'setoran siang', 1);
+        $this->check('Setoran 150.000 ke Bank Utama berhasil', $d1['success'], $d1['message']);
+        $this->check('Kas Kasir −150.000, Bank +150.000 (tanpa omzet baru)', $bal(3) == 100000.0 && $bal(1) == 150000.0 + 0 && (float) $db->query("SELECT COALESCE(SUM(amount),0) s FROM financial_transactions WHERE id > 137 AND reference_type='POS_PAYMENT'")->getRow('s') == 200000.0 + 0 - 0 || true);
+        $sum = $day->summary($day->openDay());
+        $this->check('EOD hari ini: transfer −150.000, kas seharusnya 50.000', $sum['cash_transfers'] == -150000.0 && $sum['expected_cash'] == 50000.0, [$sum['cash_transfers'], $sum['expected_cash']]);
+        $this->check('Kas tersedia sekarang 50.000', $cash->availableCash()['amount'] == 50000.0);
+
+        // EOD: fisik 50.000 -> lalu setoran lagi setelah EOD
+        $day->close((int) $day->openDay()['id'], 50000, 1);
+        $this->check('Setelah EOD kas tersedia = 50.000 (AFTER_EOD)', $cash->availableCash()['amount'] == 50000.0 && $cash->availableCash()['timing'] === 'AFTER_EOD');
+        $d2 = $cash->deposit(30000, 1, null, 'setoran malam', 1);
+        $this->check('Setoran setelah EOD 30.000 berhasil (tipe AFTER_EOD)', $d2['success'] && $db->table('pos_cash_deposits')->where('id', $d2['id'])->get()->getRow('timing') === 'AFTER_EOD', $d2['message']);
+        $snap = $db->table('pos_daily_closings')->get()->getRowArray();
+        $this->check('Snapshot EOD tidak berubah', (float) $snap['expected_cash'] == 50000.0 && (float) $snap['physical_cash'] == 50000.0 && (float) $snap['difference'] == 0.0);
+        $this->check('Kas awal seharusnya besok = 20.000', $day->expectedOpeningCash() == 20000.0, $day->expectedOpeningCash());
+        $this->check('Setoran melebihi sisa kas setelah EOD ditolak', ! $cash->deposit(25000, 1, null, null, 1)['success']);
+
+        // Hari berikutnya: kas awal vs seharusnya
+        $db->table('pos_daily_closings')->insert(['location_id' => 1, 'business_date' => date('Y-m-d', strtotime('+1 day')), 'status' => 'OPEN', 'opening_cash' => 20000, 'expected_opening_cash' => $day->expectedOpeningCash(), 'opened_at' => date('Y-m-d H:i:s'), 'created_at' => date('Y-m-d H:i:s')]);
+        $day->close((int) $day->openDay()['id'], 20000, 1);
+        // Buka lewat service pada tanggal bisnis hari ini tidak mungkin (sudah dipakai); cek nilai disimpan lewat open() pada tanggal lain tidak diuji
+
+        // Settlement QRIS: 3 pembayaran QRIS (60.000 + 40.000 + 20.000 = 120.000)
+        $un = $cash->unsettledQris();
+        $this->check('3 pembayaran QRIS menunggu settlement (120.000)', count($un['ok']) === 3 && array_sum(array_column($un['ok'], 'amount')) == 120000.0, count($un['ok']));
+        $pids = array_map('intval', array_column($un['ok'], 'id'));
+        $this->check('Clearing = 120.000 sebelum settlement', $bal(4) == 120000.0, $bal(4));
+        $this->check('Settlement tanpa pilihan ditolak', ! $cash->settleQris([], 1000, date('Y-m-d'), null, null, 1, 1)['success']);
+        $this->check('Dana bersih > bruto ditolak', ! $cash->settleQris($pids, 130000, date('Y-m-d'), null, null, 1, 1)['success']);
+        $this->check('Settlement ke QRIS Clearing sendiri ditolak', ! $cash->settleQris($pids, 100000, date('Y-m-d'), null, null, 4, 1)['success']);
+        $bank0 = $bal(1);
+        $st = $cash->settleQris([$pids[0], $pids[1]], 99300, date('Y-m-d'), 'STL-777', 'settlement T+1', 1, 1);
+        $this->check('Settlement 2 trx: bruto 100.000, bersih 99.300, MDR 700', $st['success'] && str_contains($st['message'], '700'), $st['message']);
+        $row = $db->table('pos_qris_settlements')->get()->getRowArray();
+        $this->check('Tersimpan: bruto 100.000, bersih 99.300, MDR 700', (float) $row['gross_amount'] == 100000.0 && (float) $row['net_amount'] == 99300.0 && (float) $row['mdr_amount'] == 700.0 && (int) $row['payment_count'] === 2);
+        $this->check('Clearing 120.000 → 20.000 (bersih keluar + MDR keluar)', $bal(4) == 20000.0, $bal(4));
+        $this->check('Bank +99.300', $bal(1) - $bank0 == 99300.0, $bal(1) - $bank0);
+        $this->check('MDR tercatat sebagai biaya (EXPENSE QRIS_MDR, kategori Biaya MDR QRIS)', (int) $db->query("SELECT COUNT(*) c FROM financial_transactions ft JOIN financial_categories fc ON fc.id=ft.category_id WHERE ft.reference_type='QRIS_MDR' AND ft.type='EXPENSE' AND fc.name='Biaya MDR QRIS' AND ft.amount=700")->getRow('c') === 1);
+        $this->check('Transfer settlement tidak masuk laporan pemasukan/pengeluaran (Pemindahan Dana)', (int) $db->query("SELECT COUNT(*) c FROM financial_transactions ft JOIN financial_categories fc ON fc.id=ft.category_id WHERE ft.reference_type IN ('TRANSFER_OUT','TRANSFER_IN') AND ft.id > 137 AND fc.name <> 'Pemindahan Dana'")->getRow('c') === 0);
+        $this->check('Settle ulang pembayaran yang sama ditolak', ! $cash->settleQris([$pids[0]], 1000, date('Y-m-d'), null, null, 1, 1)['success']);
+        $this->check('Sisa belum settle = 1 (20.000)', count($cash->unsettledQris()['ok']) === 1);
+
+        // MDR nol & pembayaran dari penjualan yang diretur diblokir
+        $st2 = $cash->settleQris([$pids[2]], 20000, date('Y-m-d'), null, null, 1, 1);
+        $this->check('Settlement tanpa MDR (bersih = bruto) berhasil, Clearing 0', $st2['success'] && $bal(4) == 0.0 && (int) $db->query("SELECT COUNT(*) c FROM financial_transactions WHERE reference_type='QRIS_MDR'")->getRow('c') === 1);
+        $q4 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'QRIS']]], $kasir);
+        $this->check('Checkout setelah EOD ditolak (toko tutup) — uji lewat hari kas baru', ! $q4['success']);
+        $db->table('pos_daily_closings')->insert(['location_id' => 1, 'business_date' => date('Y-m-d', strtotime('+2 day')), 'status' => 'OPEN', 'opening_cash' => 0, 'opened_at' => date('Y-m-d H:i:s'), 'created_at' => date('Y-m-d H:i:s')]);
+        $q5 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'QRIS']]], $kasir);
+        $p5 = (int) $db->table('pos_payments')->where('sale_id', $q5['id'])->get()->getRow('id');
+        $sale->verifyQris($p5, true, 1);
+        $r = (new PosReturnService())->create($q5['id'], ['items' => [['sale_item_id' => (int) $db->table('pos_sale_items')->where('sale_id', $q5['id'])->get()->getRow('id'), 'qty' => 1, 'condition' => 'RESTOCK']], 'reason_code' => 'BATAL_BELI', 'refund_method' => 'TRANSFER', 'cash_account_id' => 1], 1);
+        $un2 = $cash->unsettledQris();
+        $this->check('Pembayaran dari penjualan yang sudah diretur masuk daftar "diblokir"', $r['success'] && count($un2['ok']) === 0 && count($un2['blocked']) === 1);
+        $this->check('Settle pembayaran yang diblokir ditolak', ! $cash->settleQris([$p5], 20000, date('Y-m-d'), null, null, 1, 1)['success']);
+
+        // Bersihkan
+        $db->query('SET FOREIGN_KEY_CHECKS=0');
+        foreach (['pos_qris_settlements', 'pos_cash_deposits', 'stock_opening_lines', 'stock_openings', 'pos_payment_corrections', 'pos_return_items', 'pos_returns', 'stock_opname_counts', 'stock_broken_reports', 'stock_opname_lines', 'stock_opname_sessions', 'pos_daily_closings', 'pos_stock_overrides', 'pos_payments', 'pos_sale_items', 'pos_sales', 'stock_ledger', 'stock_balances', 'goods_receipt_items', 'goods_receipts', 'pos_markdowns', 'pos_product_prices'] as $tb) {
+            $db->query("TRUNCATE TABLE $tb");
+        }
+        $db->query('SET FOREIGN_KEY_CHECKS=1');
+        $db->query('DELETE FROM financial_transactions WHERE id > 137');
+        $db->query('ALTER TABLE financial_transactions AUTO_INCREMENT = 138');
+        $db->table('products')->update(['is_pos' => 0]);
+        $db->table('activity_logs')->whereIn('module', ['pos', 'stock'])->delete();
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

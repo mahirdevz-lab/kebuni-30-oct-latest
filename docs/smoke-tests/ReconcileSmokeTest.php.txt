@@ -1,0 +1,156 @@
+<?php
+
+namespace App\Commands;
+
+use App\Services\BrokenStockService;
+use App\Services\DailyClosingService;
+use App\Services\GoodsReceiptService;
+use App\Services\PosSaleService;
+use App\Services\ProfitShrinkageService;
+use App\Services\StockLedgerService;
+use App\Services\StockOpnameService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY: prosedur opname owner (blind -> rekonsiliasi -> hitung ulang -> konfirmasi -> posting) + analisa laba. */
+class ReconcileSmokeTest extends BaseCommand
+{
+    protected $group       = 'pos';
+    protected $name        = 'pos:reconcile-smoke';
+    protected $description = 'Smoke test rekonsiliasi opname & analisa (sementara)';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db   = db_connect();
+        $ids  = array_map('intval', array_column($db->table('products')->where('status', 'aktif')->where('deleted_at', null)->orderBy('id')->get(4)->getResultArray(), 'id'));
+        [$A, $B, $C, $D] = $ids; // D = produk di luar daftar POS (untuk uji "ditemukan saat hitung")
+        $sup  = (int) $db->table('suppliers')->where('deleted_at', null)->get(1)->getRow('id');
+        $db->table('products')->whereIn('id', [$A, $B, $C])->update(['is_pos' => 1]);
+        foreach ([$A => 15000, $B => 6000, $C => 20000] as $pid => $price) {
+            $db->table('pos_product_prices')->insert(['product_id' => $pid, 'retail_price' => $price, 'effective_from' => date('Y-m-d H:i:s', time() - 60), 'created_at' => date('Y-m-d H:i:s')]);
+        }
+        $loc = 1;
+        $led = new StockLedgerService(); $op = new StockOpnameService(); $day = new DailyClosingService(); $sale = new PosSaleService();
+        $qty = static fn (int $p) => (float) $led->balance($p, $loc)['qty'];
+        $kasir = ['user_id' => 1, 'can_override' => false];
+        $uuid  = static fn () => sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+
+        $day->open(0, 1);
+        (new GoodsReceiptService())->create(['supplier_id' => $sup, 'items' => [
+            ['product_id' => $A, 'qty_regular' => 100, 'line_cost' => 1000000],  // avg 10.000
+            ['product_id' => $B, 'qty_regular' => 50, 'line_cost' => 200000],    // avg 4.000
+            ['product_id' => $C, 'qty_regular' => 30, 'line_cost' => 450000],    // avg 15.000
+            ['product_id' => $D, 'qty_regular' => 10, 'line_cost' => 50000],     // avg 5.000 (bukan produk POS)
+        ]], 1);
+        $db->table('products')->where('id', $D)->update(['is_pos' => 0]);
+        $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 20], ['product_id' => $B, 'qty' => 10]], 'payments' => [['method' => 'CASH', 'tendered' => 360000]]], $kasir);
+        $bs = (new BrokenStockService())->create(['product_id' => $C, 'qty' => 2, 'reason_code' => 'RUSAK'], null, 1);
+        (new BrokenStockService())->approve($bs['id'], 1);
+        $day->close((int) $day->openDay()['id'], 300000, 1);
+        // Buku sekarang: A 80, B 40, C 28, D 10
+
+        $o   = $op->open(1);
+        $sid = $o['id'];
+        $lineOf = fn (int $p) => $db->table('stock_opname_lines')->where('session_id', $sid)->where('product_id', $p)->get()->getRowArray();
+        $this->check('Produk non-POS dengan saldo ikut masuk daftar (D)', (bool) $lineOf($D));
+        $this->check('Tambah produk yang sudah ada ditolak', ! $op->addLine($sid, $A, 1)['success']);
+
+        // Blind: respons count tidak membocorkan selisih
+        $r = $op->count($sid, $A, 70, null, 1);   // A: selisih 10 (12,5%, Rp100.000) -> besar
+        $this->check('Respons hitung tidak memuat selisih (blind)', $r['success'] && ! array_key_exists('difference', $r), $r);
+        $op->count($sid, $B, 39, null, 1);        // B: selisih 1 (2,5%, Rp4.000) -> kecil
+        $op->count($sid, $C, 28, null, 1);        // C: sesuai
+        $this->check('Submit ditolak bila ada yang belum dihitung (D)', ! $op->submit($sid, 1)['success']);
+        $op->count($sid, $D, 10, null, 1);
+        $s = $op->submit($sid, 1);
+        $this->check('Submit: 1 selisih besar terdeteksi (A)', $s['success'] && ($s['flags'] ?? null) === 1, $s['message']);
+        $this->check('Status A = NEED_RECOUNT, B = OK', StockOpnameService::lineState($lineOf($A)) === 'NEED_RECOUNT' && StockOpnameService::lineState($lineOf($B)) === 'OK');
+
+        $ap = $op->approve($sid, 1);
+        $this->check('Posting ditolak sebelum hitung ulang', ! $ap['success'], $ap['message']);
+        $this->check('Konfirmasi ditolak sebelum hitung ulang', ! $op->confirmLine($sid, (int) $lineOf($A)['id'], 'HILANG', 'x', 1)['success']);
+
+        // Hitung ulang hanya baris A
+        $rc = $op->requestRecount($sid, [(int) $lineOf($A)['id']], 1);
+        $this->check('Minta hitung ulang A -> putaran 2', $rc['success'] && (int) $db->table('stock_opname_sessions')->where('id', $sid)->get()->getRow('count_round') === 2, $rc['message']);
+        $this->check('Hitung B di putaran 2 ditolak (tidak diminta)', ! $op->count($sid, $B, 40, null, 1)['success']);
+        $s2 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 20000]]], $kasir);
+        $this->check('Checkout tetap terkunci selama hitung ulang', ! $s2['success']);
+
+        // Tambah produk yang ditemukan fisik (bukan di daftar): pakai produk ke-5 tanpa stok
+        $E = (int) $db->table('products')->where('status', 'aktif')->where('deleted_at', null)->whereNotIn('id', $ids)->orderBy('id')->get(1)->getRow('id');
+        $ad = $op->addLine($sid, $E, 1);
+        $this->check('Tambah produk ditemukan saat hitung (E, buku 0)', $ad['success'], $ad['message']);
+        $op->count($sid, $E, 3, 'ketemu di gudang belakang', 1);
+
+        $op->count($sid, $A, 72, 'rak bawah terlewat', 1); // hasil hitung ulang: masih selisih 8 (Rp80.000) -> besar
+        $op->submit($sid, 1);
+        $la = $lineOf($A);
+        $this->check('Riwayat A: putaran 1 = 70, putaran 2 = 72', array_map('floatval', array_column($db->table('stock_opname_counts')->where('line_id', $la['id'])->orderBy('round')->get()->getResultArray(), 'counted_qty')) === [70.0, 72.0]);
+        $this->check('A setelah hitung ulang masih besar -> NEED_CONFIRM', StockOpnameService::lineState($la) === 'NEED_CONFIRM');
+        $this->check('E (buku 0, fisik 3) -> NEED_RECOUNT', StockOpnameService::lineState($lineOf($E)) === 'NEED_RECOUNT');
+        $this->check('Posting masih ditolak', ! $op->approve($sid, 1)['success']);
+        $this->check('Konfirmasi tanpa catatan ditolak', ! $op->confirmLine($sid, (int) $la['id'], 'HILANG', '', 1)['success']);
+        $this->check('Konfirmasi A dengan penyebab & catatan', $op->confirmLine($sid, (int) $la['id'], 'HILANG', 'dihitung ulang 2 orang, rak & gudang dicek', 1)['success']);
+
+        $op->requestRecount($sid, [(int) $lineOf($E)['id']], 1);
+        $op->count($sid, $E, 3, null, 1);
+        $op->submit($sid, 1);
+        $op->confirmLine($sid, (int) $lineOf($E)['id'], 'PENERIMAAN_BELUM', 'stok lama belum diinput', 1);
+        $this->check('Konfirmasi A tetap berlaku (tidak dihitung ulang lagi)', StockOpnameService::lineState($lineOf($A)) === 'CONFIRMED');
+
+        $ap = $op->approve($sid, 1);
+        $this->check('Posting berhasil setelah semua beres', $ap['success'], $ap['message']);
+        $this->check('Saldo buku = hasil fisik (A 72, B 39, C 28, D 10, E 3)', $qty($A) === 72.0 && $qty($B) === 39.0 && $qty($C) === 28.0 && $qty($D) === 10.0 && $qty($E) === 3.0,
+            [$qty($A), $qty($B), $qty($C), $qty($D), $qty($E)]);
+
+        // Hitung ulang setelah ada mutasi pasca cut-off ditolak
+        $day2 = $db->table('pos_daily_closings')->insert(['location_id' => 1, 'business_date' => date('Y-m-d', strtotime('+1 day')), 'status' => 'OPEN', 'opening_cash' => 0, 'opened_at' => date('Y-m-d H:i:s'), 'created_at' => date('Y-m-d H:i:s')]);
+        $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $B, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 6000]]], $kasir);
+        $day->close((int) $day->openDay()['id'], 6000, 1);
+        $o2 = $op->open(1);
+        $op->count($o2['id'], $B, 30, null, 1); // B buku 38 -> fisik 30: besar
+        foreach ($db->table('stock_opname_lines')->where('session_id', $o2['id'])->where('counted_qty', null)->get()->getResultArray() as $l) {
+            $op->count($o2['id'], (int) $l['product_id'], (float) $l['book_qty'], null, 1);
+        }
+        $op->submit($o2['id'], 1);
+        $db->table('stock_ledger')->insert(['location_id' => 1, 'product_id' => $B, 'movement_type' => 'TRANSFER_IN', 'qty_in' => 0.001, 'qty_out' => 0, 'balance_before' => 0, 'balance_after' => 0, 'unit_cost' => 0, 'total_cost' => 0, 'avg_cost_after' => 0, 'value_after' => 0, 'effective_at' => date('Y-m-d H:i:s', time() + 5), 'posted_at' => date('Y-m-d H:i:s', time() + 5), 'reference_type' => 'TEST', 'reference_id' => 1]);
+        $lb = $db->table('stock_opname_lines')->where('session_id', $o2['id'])->where('product_id', $B)->get()->getRowArray();
+        $rr = $op->requestRecount($o2['id'], [(int) $lb['id']], 1);
+        $this->check('Hitung ulang ditolak bila produk sudah ada mutasi setelah cut-off', ! $rr['success'], $rr['message']);
+        $op->cancel($o2['id'], 'uji');
+
+        // Analisa laba & matriks
+        $an = (new ProfitShrinkageService())->build(date('Y-m-d'), date('Y-m-d', strtotime('+1 day')));
+        $pl = $an['pl'];
+        // Penjualan: A 20x15.000 + B 10x6.000 + B 1x6.000 = 366.000; HPP: 200.000 + 40.000 + 4.000 = 244.000
+        $this->check('Penjualan 366.000, HPP 244.000, laba kotor 122.000', $pl['revenue'] == 366000.0 && $pl['cogs'] == 244000.0 && $pl['gross'] == 122000.0, $pl);
+        // Known: C 2x15.000 = 30.000; Unknown: A 8x10.000 + B 1x4.000 = 84.000; Surplus: E 3 x 0 = 0
+        $this->check('Known 30.000, unknown 84.000, laba stlh susut 8.000', $pl['known'] == 30000.0 && $pl['unknown'] == 84000.0 && $pl['net'] == 8000.0, $pl);
+        $byId = array_column($an['products'], null, 'product_id');
+        $this->check('A fast moving & high risk -> Perbaiki handling', $byId[$A]['fast'] && $byId[$A]['high_risk'] && $byId[$A]['action'] === 'PERBAIKI', $byId[$A]);
+        $this->check('C tidak terjual tapi ada penyusutan -> Kandidat delete', $byId[$C]['action'] === 'DELETE', $byId[$C]['action']);
+
+        // Bersihkan
+        $db->query('SET FOREIGN_KEY_CHECKS=0');
+        foreach (['pos_qris_settlements', 'pos_cash_deposits', 'stock_opening_lines', 'stock_openings', 'pos_payment_corrections', 'pos_return_items', 'pos_returns', 'stock_opname_counts', 'stock_broken_reports', 'stock_opname_lines', 'stock_opname_sessions', 'pos_daily_closings', 'pos_stock_overrides', 'pos_payments', 'pos_sale_items', 'pos_sales', 'stock_ledger', 'stock_balances', 'goods_receipt_items', 'goods_receipts', 'pos_markdowns', 'pos_product_prices'] as $tb) {
+            $db->query("TRUNCATE TABLE $tb");
+        }
+        $db->query('SET FOREIGN_KEY_CHECKS=1');
+        $db->table('financial_transactions')->whereIn('reference_type', ['POS_PAYMENT', 'POS_REFUND'])->delete();
+        $db->table('products')->whereIn('id', array_merge($ids, [$E]))->update(['is_pos' => 0]);
+        $db->table('activity_logs')->whereIn('module', ['pos', 'stock'])->delete();
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

@@ -1,0 +1,176 @@
+<?php
+
+namespace App\Commands;
+
+use App\Services\GoodsReceiptService;
+use App\Services\PosPricingService;
+use App\Services\PosSaleService;
+use App\Services\StockLedgerService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY smoke test untuk Fase 1 POS. Membersihkan data uji sendiri. */
+class PosSmokeTest extends BaseCommand
+{
+    protected $group       = 'pos';
+    protected $name        = 'pos:smoke';
+    protected $description = 'Smoke test POS (sementara)';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db   = db_connect();
+        $prod = $db->table('products')->where('status', 'aktif')->where('deleted_at', null)->orderBy('id')->get(2)->getResultArray();
+        $A    = (int) $prod[0]['id'];
+        $B    = (int) $prod[1]['id'];
+        $sup  = (int) $db->table('suppliers')->where('deleted_at', null)->get(1)->getRow('id');
+        $db->table('products')->whereIn('id', [$A, $B])->update(['is_pos' => 1]);
+        $loc  = 1;
+        $led  = new StockLedgerService();
+        $pr   = new PosPricingService();
+        $sale = new PosSaleService();
+        $gr   = new GoodsReceiptService();
+        $pr->setRetailPrice($A, 12000, date('Y-m-d H:i:s', time() - 60));
+        $pr->setRetailPrice($B, 5000, date('Y-m-d H:i:s', time() - 60));
+        $kasir = ['user_id' => 1, 'can_override' => false];
+        $spv   = ['user_id' => 1, 'can_override' => true];
+        $uuid  = static fn () => sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+        $acc   = static fn (int $id) => (float) db_connect()->query("SELECT COALESCE(SUM(CASE WHEN type='INCOME' THEN amount ELSE -amount END),0) s FROM financial_transactions WHERE cash_account_id=?", [$id])->getRow('s');
+        $cashBal = static fn () => $acc(3);
+        $qrisBal = static fn () => $acc(4);
+
+        // 0. Checkout tanpa buka toko ditolak; buka toko
+        $days = new \App\Services\DailyClosingService();
+        $s0   = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 50000]]], $kasir);
+        $this->check('Checkout sebelum buka toko ditolak', ! $s0['success'], $s0['message']);
+        $o = $days->open(100000, 1);
+        $this->check('Buka toko kas awal 100.000', $o['success'], $o['message']);
+        $this->check('Buka toko kedua kali ditolak', ! $days->open(0, 1)['success']);
+
+        // 1. Penerimaan 100 + bonus 10, biaya 1.000.000 (allocate)
+        $gr->create(['supplier_id' => $sup, 'items' => [['product_id' => $A, 'qty_regular' => 100, 'qty_bonus' => 10, 'line_cost' => 1000000]]], 1);
+        $b = $led->balance($A, $loc);
+        $this->check('Penerimaan 100+10 => stok 110', (float) $b['qty'] === 110.0, $b);
+        $this->check('Moving average = 9090.9091 (allocate)', abs((float) $b['avg_cost'] - 9090.9091) < 0.001, $b['avg_cost']);
+        $this->check('Ledger: PURCHASE & BONUS terpisah', $db->table('stock_ledger')->where('product_id', $A)->whereIn('movement_type', ['PURCHASE', 'BONUS'])->countAllResults() === 2);
+        $gr->create(['supplier_id' => $sup, 'items' => [['product_id' => $B, 'qty_regular' => 5, 'line_cost' => 20000]]], 1);
+
+        // 2. Penjualan tunai
+        $u1 = $uuid();
+        $s1 = $sale->checkout(['client_uuid' => $u1, 'items' => [['product_id' => $A, 'qty' => 2.5]], 'payments' => [['method' => 'CASH', 'tendered' => 50000]]], $kasir);
+        $this->check('Tunai 2.5kg x 12000 = 30000, kembalian 20000', $s1['success'] && $s1['grand_total'] == 30000 && $s1['change_amount'] == 20000 && $s1['payment_status'] === 'PAID', $s1);
+        $this->check('Stok A = 107.5', (float) $led->balance($A, $loc)['qty'] === 107.5);
+        $this->check('Kas Kasir +30000 (bukan 50000)', $cashBal() == 30000.0, $cashBal());
+        $row = $db->table('pos_sales')->where('id', $s1['id'])->get()->getRowArray();
+        $this->check('HPP snapshot = 2.5 x 9090.9091', abs((float) $row['cogs_total'] - 22727.27) < 0.02, $row['cogs_total']);
+
+        // 3. Klik ganda
+        $s1b = $sale->checkout(['client_uuid' => $u1, 'items' => [['product_id' => $A, 'qty' => 2.5]], 'payments' => [['method' => 'CASH', 'tendered' => 50000]]], $kasir);
+        $this->check('Retry uuid sama => duplicate, tidak ganda', $s1b['success'] && $s1b['duplicate'] && $s1b['id'] === $s1['id'] && (float) $led->balance($A, $loc)['qty'] === 107.5 && $cashBal() == 30000.0);
+
+        // 4. Stok kurang ditolak, kasir vs supervisor
+        $before = $db->table('pos_sales')->countAllResults();
+        $s2     = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $B, 'qty' => 6]], 'payments' => [['method' => 'CASH', 'tendered' => 30000]]], $kasir);
+        $this->check('Stok kurang ditolak', ! $s2['success'], $s2['message'] ?? '');
+        $this->check('Penolakan tidak meninggalkan baris/mutasi', $db->table('pos_sales')->countAllResults() === $before && (float) $led->balance($B, $loc)['qty'] === 5.0);
+        $s2b = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $B, 'qty' => 6]], 'payments' => [['method' => 'CASH', 'tendered' => 30000]], 'override_reason' => ''], $spv);
+        $this->check('Supervisor tanpa alasan tetap ditolak', ! $s2b['success']);
+        $s2c = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $B, 'qty' => 6]], 'payments' => [['method' => 'CASH', 'tendered' => 30000]], 'override_reason' => 'Penerimaan belum dicatat'], $spv);
+        $this->check('Override supervisor + alasan lolos & tercatat', $s2c['success'] && $db->table('pos_stock_overrides')->countAllResults() === 1 && (float) $led->balance($B, $loc)['qty'] === -1.0, $led->balance($B, $loc));
+        $sale->void($s2c['id'], 'uji override', 1);
+
+        // 5. BOGO
+        $s3 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1, 'free_qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 12000]]], $kasir);
+        $it = $db->table('pos_sale_items')->where('sale_id', $s3['id'])->orderBy('line_no')->get()->getResultArray();
+        $this->check('BOGO: 2 unit keluar, total 12000, free line Rp0 tapi HPP > 0', $s3['success'] && $s3['grand_total'] == 12000 && count($it) === 2 && $it[1]['line_type'] === 'PROMO_FREE' && (float) $it[1]['line_total'] == 0 && (float) $it[1]['cogs'] > 0, $it);
+        $this->check('Ledger PROMO_FREE terpisah dari BONUS', $db->table('stock_ledger')->where('movement_type', 'PROMO_FREE')->countAllResults() === 1);
+
+        // 6. QRIS
+        $s4 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'QRIS', 'reference_no' => 'QR-1']]], $kasir);
+        $this->check('QRIS belum diverifikasi => PENDING, kas clearing 0', $s4['payment_status'] === 'PENDING_VERIFICATION' && $qrisBal() == 0.0, $s4);
+        $pay = (int) $db->table('pos_payments')->where('sale_id', $s4['id'])->get()->getRow('id');
+        $v   = $sale->verifyQris($pay, true, 1);
+        $this->check('Verifikasi QRIS => PAID & QRIS Clearing +12000', $v['success'] && $qrisBal() == 12000.0 && $db->table('pos_sales')->where('id', $s4['id'])->get()->getRow('payment_status') === 'PAID');
+        $v2 = $sale->verifyQris($pay, true, 1);
+        $this->check('Verifikasi ulang ditolak (tidak ganda)', ! $v2['success'] && $qrisBal() == 12000.0);
+
+        // 7. Pembayaran kurang tanpa pelanggan
+        $s5 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 5000]]], $kasir);
+        $this->check('Bayar kurang tanpa pelanggan ditolak', ! $s5['success']);
+
+        // 8. Markdown
+        $pr->createMarkdown($A, 9000, 'Mendekati batas kualitas', date('Y-m-d H:i:s', time() - 30), date('Y-m-d H:i:s', time() + 3600), 1);
+        $s6 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 2]], 'payments' => [['method' => 'CASH', 'tendered' => 18000]]], $kasir);
+        $this->check('Markdown 9000 diterapkan, list_price tersimpan 12000', $s6['success'] && $s6['grand_total'] == 18000 && (float) $db->table('pos_sale_items')->where('sale_id', $s6['id'])->get()->getRow('list_price') == 12000);
+
+        // 9. Void penjualan s1 (tunai 30000)
+        $balBefore  = (float) $led->balance($A, $loc)['qty'];
+        $cashBefore = $cashBal();
+        $vd         = $sale->void($s1['id'], 'Salah input', 1);
+        $this->check('Void: stok kembali +2.5, kas -30000, status VOIDED', $vd['success'] && (float) $led->balance($A, $loc)['qty'] === $balBefore + 2.5 && $cashBal() == $cashBefore - 30000 && $db->table('pos_sales')->where('id', $s1['id'])->get()->getRow('status') === 'VOIDED', $vd);
+        $vd2 = $sale->void($s1['id'], 'lagi', 1);
+        $this->check('Void ulang ditolak', ! $vd2['success']);
+
+        // 10. Konsistensi ledger vs saldo
+        foreach ([$A, $B] as $pid) {
+            $sum = $db->query('SELECT COALESCE(SUM(qty_in-qty_out),0) s FROM stock_ledger WHERE product_id=? AND location_id=1', [$pid])->getRow('s');
+            $this->check("Saldo = Σ ledger (produk $pid)", (float) $sum === (float) $led->balance($pid, $loc)['qty'], [$sum, $led->balance($pid, $loc)['qty']]);
+        }
+
+        // 11. EOD
+        $op   = new \App\Services\StockOpnameService();
+        $this->check('Opname ditolak saat toko masih buka', ! $op->open(1)['success']);
+        $sum  = $days->summary($days->openDay());
+        // kas: 100000 awal + tunai (30000 + 30000 + 12000 + 18000) - refund (30000 + 30000) = 130000
+        $this->check('EOD kas seharusnya = 130.000', $sum['expected_cash'] == 130000.0, $sum);
+        $this->check('EOD QRIS terkonfirmasi 12.000, pending 0', $sum['qris_confirmed'] == 12000.0 && $sum['qris_pending_count'] === 0);
+        $c = $days->close((int) $sum['id'], 129000, 1, 'kurang 1000');
+        $this->check('EOD selisih -1.000 tercatat', $c['success'] && $c['difference'] == -1000.0, $c);
+        $s7 = $sale->checkout(['client_uuid' => $uuid(), 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 50000]]], $kasir);
+        $this->check('Checkout setelah EOD ditolak', ! $s7['success'], $s7['message']);
+        $this->check('Void setelah EOD ditolak', ! $sale->void($s6['id'], 'telat', 1)['success']);
+
+        // 12. Opname setelah EOD
+        $bookA = (float) $led->balance($A, $loc)['qty'];
+        $os    = $op->open(1);
+        $this->check('Opname dibuka setelah EOD', $os['success'], $os['message']);
+        $sid   = $os['id'];
+        $this->check('Buka toko ditolak saat opname dihitung', ! $days->open(0, 1)['success']);
+        $this->check('Penerimaan ditolak saat opname dihitung', ! $gr->create(['supplier_id' => $sup, 'items' => [['product_id' => $A, 'qty_regular' => 1, 'line_cost' => 1]]], 1)['success']);
+        $this->check('Submit ditolak bila belum semua dihitung', ! $op->submit($sid, 1)['success']);
+        $lineIds = $db->table('stock_opname_lines')->where('session_id', $sid)->get()->getResultArray();
+        foreach ($lineIds as $l) {
+            $pid = (int) $l['product_id'];
+            $op->count($sid, $pid, $pid === $A ? $bookA - 3 : (float) $l['book_qty'], $pid === $A ? 'busuk dibuang' : null, 1);
+        }
+        $this->check('Book qty snapshot A = ' . $bookA, (float) $db->table('stock_opname_lines')->where('session_id', $sid)->where('product_id', $A)->get()->getRow('book_qty') === $bookA);
+        $this->check('Submit berhasil', $op->submit($sid, 1)['success']);
+        $ap = $op->approve($sid, 1);
+        $this->check('Approve memposting 1 adjustment', $ap['success'] && $db->table('stock_ledger')->where('movement_type', 'OPNAME_ADJUST')->countAllResults() === 1, $ap);
+        $this->check('Stok A berkurang 3 setelah opname', (float) $led->balance($A, $loc)['qty'] === $bookA - 3);
+        $this->check('Approve ulang ditolak', ! $op->approve($sid, 1)['success']);
+        $sumA = $db->query('SELECT COALESCE(SUM(qty_in-qty_out),0) s FROM stock_ledger WHERE product_id=?', [$A])->getRow('s');
+        $this->check('Saldo = Σ ledger setelah opname', (float) $sumA === (float) $led->balance($A, $loc)['qty']);
+
+        // Bersihkan
+        $db->query('SET FOREIGN_KEY_CHECKS=0');
+        foreach (['pos_qris_settlements', 'pos_cash_deposits', 'stock_opening_lines', 'stock_openings', 'pos_payment_corrections', 'pos_return_items', 'pos_returns', 'stock_opname_counts', 'stock_opname_lines', 'stock_opname_sessions', 'pos_daily_closings', 'pos_stock_overrides', 'pos_payments', 'pos_sale_items', 'pos_sales', 'stock_ledger', 'stock_balances', 'goods_receipt_items', 'goods_receipts', 'pos_markdowns', 'pos_product_prices'] as $t) {
+            $db->query("TRUNCATE TABLE $t");
+        }
+        $db->query('SET FOREIGN_KEY_CHECKS=1');
+        $db->table('financial_transactions')->whereIn('reference_type', ['POS_PAYMENT', 'POS_REFUND'])->delete();
+        $db->table('products')->whereIn('id', [$A, $B])->update(['is_pos' => 0]);
+        $db->table('activity_logs')->whereIn('module', ['pos', 'stock'])->delete();
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

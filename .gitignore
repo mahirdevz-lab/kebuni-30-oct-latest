@@ -1,0 +1,64 @@
+# ============================================================
+# Kebuni Backoffice (MIS) — .gitignore
+# Basis: CodeIgniter 4 appstarter + aturan keamanan Kebuni
+# ATURAN EMAS: .env (kredensial DB) & artefak backup TIDAK PERNAH boleh ter-commit.
+# ============================================================
+
+# ---------- Dependencies (reproducible via composer.lock) ----------
+/vendor/
+/node_modules/
+
+# ---------- Environment & secrets ----------
+.env
+.env.*
+!.env.example
+!.env.*.example
+# template resmi CI4 (tanpa kredensial) AMAN ikut:
+# (file "env" tanpa titik-awal sengaja TIDAK di-ignore)
+
+# ---------- Backup / dump / arsip (larangan keras) ----------
+*.sql
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.bak
+*.bak.*
+*.orig
+*.dump
+
+# ---------- Runtime writable (CI4: simpan hanya index.html) ----------
+/writable/cache/*
+/writable/debugbar/*
+/writable/logs/*
+/writable/session/*
+/writable/uploads/*
+/writable/backups/*   # dump database (berisi hash password) - JANGAN di-commit/di-upload
+!/writable/**/index.html
+
+# ---------- Log & cache tooling ----------
+*.log
+php_errors.log
+.phpunit.result.cache
+.php-cs-fixer.cache
+.phpstan.cache
+
+# ---------- OS / editor ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- Dev / build artefacts ----------
+*.phar
+composer.phar
+npm-debug.log*
+yarn-error.log*

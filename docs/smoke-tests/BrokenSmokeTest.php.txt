@@ -1,0 +1,129 @@
+<?php
+
+namespace App\Commands;
+
+use App\Services\BrokenStockService;
+use App\Services\DailyClosingService;
+use App\Services\GoodsReceiptService;
+use App\Services\ShrinkageReportService;
+use App\Services\StockLedgerService;
+use App\Services\StockOpnameService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY smoke test Broken Stock & laporan penyusutan. Membersihkan data uji sendiri. */
+class BrokenSmokeTest extends BaseCommand
+{
+    protected $group       = 'pos';
+    protected $name        = 'pos:broken-smoke';
+    protected $description = 'Smoke test Broken Stock (sementara)';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db  = db_connect();
+        $A   = (int) $db->table('products')->where('status', 'aktif')->where('deleted_at', null)->orderBy('id')->get(1)->getRow('id');
+        $sup = (int) $db->table('suppliers')->where('deleted_at', null)->get(1)->getRow('id');
+        $db->table('products')->where('id', $A)->update(['is_pos' => 1]);
+        $loc = 1;
+        $led = new StockLedgerService();
+        $bs  = new BrokenStockService();
+        $op  = new StockOpnameService();
+        $day = new DailyClosingService();
+        $qty = static fn () => (float) $led->balance($A, $loc)['qty'];
+
+        $day->open(0, 1);
+        (new GoodsReceiptService())->create(['supplier_id' => $sup, 'items' => [['product_id' => $A, 'qty_regular' => 120, 'line_cost' => 1200000]]], 1);
+        $this->check('Stok awal uji 120 (avg 10.000)', $qty() === 120.0);
+
+        // Validasi input
+        $this->check('Qty 0 ditolak', ! $bs->create(['product_id' => $A, 'qty' => 0, 'reason_code' => 'BUSUK'], null, 1)['success']);
+        $this->check('Alasan LAINNYA tanpa keterangan ditolak', ! $bs->create(['product_id' => $A, 'qty' => 1, 'reason_code' => 'LAINNYA'], null, 1)['success']);
+
+        // Draft tidak mengurangi stok
+        $r1 = $bs->create(['product_id' => $A, 'qty' => 5, 'reason_code' => 'BUSUK', 'reason' => 'tomat lembek'], null, 1);
+        $this->check('Draft 5 kg tersimpan', $r1['success'], $r1['message']);
+        $this->check('Draft tidak mengurangi stok (tetap 120)', $qty() === 120.0);
+        $est = (float) $db->table('stock_broken_reports')->where('id', $r1['id'])->get()->getRow('est_value');
+        $this->check('Estimasi nilai = 5 x 10.000', $est == 50000.0, $est);
+
+        // Opname tidak bisa dibuka selama masih ada draft
+        $day->close((int) $day->openDay()['id'], 0, 1);
+        $o = $op->open(1);
+        $this->check('Opname ditolak bila ada draft Broken Stock', ! $o['success'], $o['message']);
+
+        // Cancel oleh bukan pelapor ditolak
+        $this->check('Batal oleh bukan pelapor ditolak', ! $bs->cancel($r1['id'], 999)['success']);
+
+        // Approve
+        $a = $bs->approve($r1['id'], 1);
+        $this->check('Approve -> stok 115', $a['success'] && $qty() === 115.0, $a['message']);
+        $row = $db->table('stock_broken_reports')->where('id', $r1['id'])->get()->getRowArray();
+        $this->check('Status POSTED + nilai posting 50.000 + ledger BROKEN', $row['status'] === 'POSTED' && (float) $row['posted_value'] == 50000.0
+            && $db->table('stock_ledger')->where('id', $row['ledger_id'])->get()->getRow('movement_type') === 'BROKEN');
+        $this->check('Approve ulang ditolak', ! $bs->approve($r1['id'], 1)['success']);
+
+        // Melebihi stok buku -> approve ditolak, lalu ditolak (reject)
+        $r2 = $bs->create(['product_id' => $A, 'qty' => 200, 'reason_code' => 'RUSAK'], null, 1);
+        $this->check('Draft melebihi stok tetap bisa dilapor dengan peringatan', $r2['success'] && str_contains($r2['message'], 'Perhatian'));
+        $a2 = $bs->approve($r2['id'], 1);
+        $this->check('Approve melebihi stok ditolak', ! $a2['success'] && $qty() === 115.0, $a2['message']);
+        $this->check('Reject tanpa alasan ditolak', ! $bs->reject($r2['id'], '', 1)['success']);
+        $this->check('Reject dengan alasan -> stok tetap', $bs->reject($r2['id'], 'salah satuan', 1)['success'] && $qty() === 115.0);
+
+        // Opname: buku 115, fisik 110 -> unknown 5 (contoh PRD FR-11)
+        $o = $op->open(1);
+        $this->check('Opname dibuka setelah draft selesai', $o['success'], $o['message']);
+        $r3 = $bs->create(['product_id' => $A, 'qty' => 1, 'reason_code' => 'HAMA'], null, 1);
+        $a3 = $bs->approve($r3['id'], 1);
+        $this->check('Approve Broken Stock ditolak saat opname dihitung', ! $a3['success'] && $qty() === 115.0, $a3['message']);
+        $book = (float) $db->table('stock_opname_lines')->where('session_id', $o['id'])->where('product_id', $A)->get()->getRow('book_qty');
+        $this->check('Snapshot buku = 115 (Broken Stock sudah mengurangi)', $book === 115.0, $book);
+        foreach ($db->table('stock_opname_lines')->where('session_id', $o['id'])->get()->getResultArray() as $l) {
+            $op->count($o['id'], (int) $l['product_id'], (int) $l['product_id'] === $A ? 110 : (float) $l['book_qty'], null, 1);
+        }
+        $op->submit($o['id'], 1);
+        // Prosedur baru: selisih besar (5 kg = Rp50.000) wajib hitung ulang lalu dikonfirmasi sebelum posting.
+        $lineA = $db->table('stock_opname_lines')->where('session_id', $o['id'])->where('product_id', $A)->get()->getRowArray();
+        $op->requestRecount($o['id'], [(int) $lineA['id']], 1);
+        $op->count($o['id'], $A, 110, null, 1);
+        $op->submit($o['id'], 1);
+        $op->confirmLine($o['id'], (int) $lineA['id'], 'HILANG', 'sudah dihitung ulang', 1);
+        $op->approve($o['id'], 1);
+        $bs->reject($r3['id'], 'uji', 1);
+        $this->check('Stok akhir 110', $qty() === 110.0);
+
+        // Laporan
+        $rep = (new ShrinkageReportService())->build(date('Y-m-d'), date('Y-m-d'));
+        $t   = $rep['totals'];
+        $this->check('Known = 50.000, Unknown = 50.000, Total = 100.000', $t['known'] == 50000.0 && $t['unknown'] == 50000.0 && $t['total'] == 100000.0, $t);
+        $p = $rep['byProduct'][0] ?? [];
+        $this->check('Per produk: known 5 kg, unknown 5 kg', ($p['known_qty'] ?? 0) == 5.0 && ($p['unknown_qty'] ?? 0) == 5.0, $p);
+        $this->check('Per alasan: BUSUK 50.000', ($rep['byReason']['BUSUK'] ?? 0) == 50000.0, $rep['byReason']);
+        $this->check('Daftar known memuat semua status (POSTED, REJECTED x2)', count($rep['known']) === 3, count($rep['known']));
+        $this->check('Tidak ada draft tersisa', $rep['pending']['count'] === 0);
+        $sum = $db->query('SELECT COALESCE(SUM(qty_in-qty_out),0) s FROM stock_ledger WHERE product_id=?', [$A])->getRow('s');
+        $this->check('Saldo = Σ ledger', (float) $sum === $qty());
+
+        // Bersihkan
+        $db->query('SET FOREIGN_KEY_CHECKS=0');
+        foreach (['pos_qris_settlements', 'pos_cash_deposits', 'stock_opening_lines', 'stock_openings', 'pos_payment_corrections', 'pos_return_items', 'pos_returns', 'stock_opname_counts', 'stock_broken_reports', 'stock_opname_lines', 'stock_opname_sessions', 'pos_daily_closings', 'pos_stock_overrides', 'pos_payments', 'pos_sale_items', 'pos_sales', 'stock_ledger', 'stock_balances', 'goods_receipt_items', 'goods_receipts', 'pos_markdowns', 'pos_product_prices'] as $tb) {
+            $db->query("TRUNCATE TABLE $tb");
+        }
+        $db->query('SET FOREIGN_KEY_CHECKS=1');
+        $db->table('financial_transactions')->whereIn('reference_type', ['POS_PAYMENT', 'POS_REFUND'])->delete();
+        $db->table('products')->where('id', $A)->update(['is_pos' => 0]);
+        $db->table('activity_logs')->whereIn('module', ['pos', 'stock'])->delete();
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

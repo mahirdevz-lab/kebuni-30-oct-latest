@@ -1,0 +1,62 @@
+<?php
+
+namespace App\Commands;
+
+use App\Services\FinalReportService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY: verifikasi perbaikan F1 Final Report; mengembalikan data stock_opnames periode 116 seperti semula. */
+class F1FixTest extends BaseCommand
+{
+    protected $group = 'pos';
+    protected $name  = 'pos:f1-test';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db     = db_connect();
+        $before = $db->table('stock_opnames')->where('price_period_id', 116)->get()->getResultArray();
+        $svc    = new FinalReportService();
+
+        $r = $svc->stockReport(116);
+        $this->check('Setelah perbaikan: susut periode 116 = 0 (semua belum dihitung)', $r['total_shrink_value'] == 0.0 && $r['n_input'] === 0 && $r['n_pending'] === 13, [$r['total_shrink_value'], $r['n_input'], $r['n_pending']]);
+        $jag = array_values(array_filter($r['rows'], static fn ($x) => $x['product_id'] === 58))[0];
+        $this->check('Jagung: saldo buku tetap 150, stok aktual kosong, susut tidak dihitung', $jag['stok_buku'] == 150.0 && $jag['stok_aktual'] === null && ! $jag['has_opname'] && $jag['shrink_value'] == 0.0, $jag);
+
+        // Simpan lewat jalur yang sama dengan tombol "Simpan Opname": Jagung 140, Kunyit 0, Kol kosong
+        $svc->saveOpname(116, [
+            ['product_id' => 58, 'stok_awal' => 300, 'pembelian' => 300, 'stok_aktual' => 140],
+            ['product_id' => 13, 'stok_awal' => 255, 'pembelian' => 255, 'stok_aktual' => 0],
+            ['product_id' => 12, 'stok_awal' => 930, 'pembelian' => 930, 'stok_aktual' => null],
+        ], 1);
+        $row = static fn (int $pid) => db_connect()->table('stock_opnames')->where('price_period_id', 116)->where('product_id', $pid)->get()->getRowArray();
+        $this->check('Simpan: 140 tersimpan, 0 tetap 0 (habis), kosong tetap NULL', (float) $row(58)['stok_aktual'] === 140.0 && $row(13)['stok_aktual'] !== null && (float) $row(13)['stok_aktual'] === 0.0 && $row(12)['stok_aktual'] === null);
+
+        $r2 = $svc->stockReport(116);
+        $this->check('Hanya Jagung & Kunyit dihitung: 2 diinput, 11 belum', $r2['n_input'] === 2 && $r2['n_pending'] === 11, [$r2['n_input'], $r2['n_pending']]);
+        // Jagung: aktual 140 vs buku 150 -> -10 kg x 11.300 = -113.000; Kunyit: buku 0, aktual 0 -> 0
+        $this->check('Total susut = −113.000 (hanya Jagung)', abs($r2['total_shrink_value'] + 113000) < 0.01, $r2['total_shrink_value']);
+
+        // Kembalikan data persis seperti sebelum uji
+        foreach ($before as $b) {
+            $db->table('stock_opnames')->where('id', $b['id'])->update([
+                'stok_awal' => $b['stok_awal'], 'pembelian' => $b['pembelian'], 'stok_aktual' => $b['stok_aktual'],
+                'notes' => $b['notes'], 'created_by' => $b['created_by'], 'updated_at' => $b['updated_at'],
+            ]);
+        }
+        $after = $db->table('stock_opnames')->where('price_period_id', 116)->get()->getResultArray();
+        $this->check('Data stock_opnames dikembalikan persis', $after == $before);
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}

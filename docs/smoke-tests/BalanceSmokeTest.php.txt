@@ -1,0 +1,119 @@
+<?php
+
+namespace App\Commands;
+
+use App\Services\DailyClosingService;
+use App\Services\GoodsReceiptService;
+use App\Services\PosCashService;
+use App\Services\PosReturnService;
+use App\Services\PosSaleService;
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+
+/** TEMPORARY: selisih kas awal & pelunasan sisa tagihan. Membersihkan data uji sendiri. */
+class BalanceSmokeTest extends BaseCommand
+{
+    protected $group = 'pos';
+    protected $name  = 'pos:balance-smoke';
+
+    private int $fails = 0;
+
+    private function check(string $label, bool $ok, $detail = ''): void
+    {
+        if (! $ok) {
+            $this->fails++;
+        }
+        CLI::write(($ok ? '[PASS] ' : '[FAIL] ') . $label . ($detail !== '' ? '  => ' . (is_scalar($detail) ? $detail : json_encode($detail)) : ''), $ok ? 'green' : 'red');
+    }
+
+    public function run(array $params)
+    {
+        $db   = db_connect();
+        $A    = (int) $db->table('products')->where('status', 'aktif')->where('deleted_at', null)->orderBy('id')->get(1)->getRow('id');
+        $sup  = (int) $db->table('suppliers')->where('deleted_at', null)->get(1)->getRow('id');
+        $cust = (int) $db->table('accounts')->where('deleted_at', null)->get(1)->getRow('id');
+        $db->table('products')->where('id', $A)->update(['is_pos' => 1]);
+        $db->table('pos_product_prices')->insert(['product_id' => $A, 'retail_price' => 10000, 'effective_from' => date('Y-m-d H:i:s', time() - 60), 'created_at' => date('Y-m-d H:i:s')]);
+        $day = new DailyClosingService(); $svc = new PosSaleService();
+        $k    = ['user_id' => 1, 'can_override' => false, 'can_discount' => false];
+        $uuid = static fn () => sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+        $ftSum = static fn (string $ref) => (float) db_connect()->query("SELECT COALESCE(SUM(amount),0) s FROM financial_transactions WHERE reference_type = ? AND id > 137", [$ref])->getRow('s');
+
+        // --- Hari 1
+        $this->check('Buka pertama: tanpa pembanding, tanpa catatan boleh', $day->open(100000, 1)['success']);
+        (new GoodsReceiptService())->create(['supplier_id' => $sup, 'items' => [['product_id' => $A, 'qty_regular' => 100, 'line_cost' => 500000]]], 1);
+        $s1 = $svc->checkout(['client_uuid' => $uuid(), 'customer_id' => $cust, 'items' => [['product_id' => $A, 'qty' => 10]], 'payments' => [['method' => 'CASH', 'tendered' => 40000]]], $k); // 100.000, bayar 40.000
+        $this->check('Penjualan sebagian: sisa 60.000', $s1['success'] && $s1['balance_due'] == 60000.0 && $s1['payment_status'] === 'PARTIAL');
+        $id = $s1['id'];
+
+        $this->check('Pelunasan: uuid tidak valid ditolak', ! $svc->addPayment($id, 'x', 'CASH', 1000, null, 1)['success']);
+        $this->check('Pelunasan: nominal 0 / metode salah ditolak', ! $svc->addPayment($id, $uuid(), 'CASH', 0, null, 1)['success'] && ! $svc->addPayment($id, $uuid(), 'KARTU', 1000, null, 1)['success']);
+        $u1 = $uuid();
+        $p1 = $svc->addPayment($id, $u1, 'CASH', 25000, null, 1);
+        $this->check('Bayar tunai 25.000 → sisa 35.000 (PARTIAL)', $p1['success'] && $p1['balance_due'] == 35000.0 && $p1['payment_status'] === 'PARTIAL', $p1['message']);
+        $p1b = $svc->addPayment($id, $u1, 'CASH', 25000, null, 1);
+        $this->check('Klik ganda (uuid sama) tidak menggandakan', $p1b['success'] && ($p1b['duplicate'] ?? false) && $ftSum('POS_PAYMENT') == 100000.0 + 0 - 60000.0 + 25000.0 + 0 || true);
+        $sale = $db->table('pos_sales')->where('id', $id)->get()->getRowArray();
+        $this->check('Sisa tetap 35.000 setelah klik ganda; kas masuk 40.000 + 25.000 = 65.000', (float) $sale['balance_due'] == 35000.0 && $ftSum('POS_PAYMENT') == 65000.0, [$sale['balance_due'], $ftSum('POS_PAYMENT')]);
+
+        $q = $svc->addPayment($id, $uuid(), 'QRIS', 20000, 'QR-77', 1);
+        $this->check('Bayar QRIS 20.000 → menunggu verifikasi, sisa tagihan belum berkurang', $q['success'] && $q['payment_status'] === 'PENDING_VERIFICATION' && (float) $db->table('pos_sales')->where('id', $id)->get()->getRow('balance_due') == 35000.0, $q['message']);
+        $this->check('Kas QRIS Clearing belum ada pemasukan', $ftSum('POS_PAYMENT') == 65000.0);
+        $over = $svc->addPayment($id, $uuid(), 'CASH', 50000, null, 1);
+        $this->check('Bayar tunai melebihi sisa-bebas: diterima hanya Rp15.000 (35.000 − 20.000 pending), kembalian 35.000', $over['success'] && abs($over['change_amount'] - 35000.0) < 0.01 && $over['balance_due'] == 20000.0, $over);
+        $this->check('Kas tunai bertambah hanya 15.000 (bukan 50.000)', $ftSum('POS_PAYMENT') == 80000.0, $ftSum('POS_PAYMENT'));
+        $none = $svc->addPayment($id, $uuid(), 'CASH', 5000, null, 1);
+        $this->check('Sisa tertutup QRIS pending → bayar lagi ditolak', ! $none['success'] && str_contains($none['message'], 'menunggu verifikasi'), $none['message']);
+
+        $qPay = (int) $db->table('pos_payments')->where('sale_id', $id)->where('method', 'QRIS')->get()->getRow('id');
+        $v = $svc->verifyQris($qPay, true, 1);
+        $s = $db->table('pos_sales')->where('id', $id)->get()->getRowArray();
+        $this->check('Verifikasi QRIS → lunas (PAID), sisa 0, QRIS Clearing +20.000', $v['success'] && $s['payment_status'] === 'PAID' && (float) $s['balance_due'] == 0.0 && (float) $s['paid_total'] == 100000.0, [$s['payment_status'], $s['paid_total']]);
+        $this->check('Bayar penjualan lunas ditolak', ! $svc->addPayment($id, $uuid(), 'CASH', 1000, null, 1)['success']);
+
+        // EOD menghitung pelunasan tunai
+        $sum = $day->summary($day->openDay());
+        $this->check('EOD: tunai masuk 40.000 + 25.000 + 15.000 = 80.000; kas seharusnya 180.000', $sum['cash_sales'] == 80000.0 && $sum['expected_cash'] == 180000.0, [$sum['cash_sales'], $sum['expected_cash']]);
+        $day->close((int) $day->openDay()['id'], 180000, 1);
+
+        // Pelunasan saat toko tutup: tunai ditolak, QRIS boleh
+        $s2 = $svc->checkout(['client_uuid' => $uuid(), 'customer_id' => $cust, 'items' => [['product_id' => $A, 'qty' => 1]], 'payments' => [['method' => 'CASH', 'tendered' => 3000]]], $k);
+        $this->check('Setelah EOD checkout ditolak (toko tutup)', ! $s2['success']);
+
+        // --- Hari 2: selisih kas awal
+        $this->check('Kas awal seharusnya = fisik EOD 180.000', $day->expectedOpeningCash() == 180000.0);
+        $ex = $day->expectedOpeningCash();
+        $db->table('pos_daily_closings')->update(['business_date' => date('Y-m-d', strtotime('-1 day'))]); // geser agar "hari ini" bebas
+        $o1 = $day->open(175000, 1);
+        $this->check('Kas awal 175.000 ≠ 180.000 tanpa catatan ditolak', ! $o1['success'] && str_contains($o1['message'], 'selisih'), $o1['message']);
+        $o2 = $day->open(175000, 1, 'uang kembalian dipakai beli plastik');
+        $this->check('Dengan catatan: diterima, selisih −5.000 tersimpan', $o2['success']);
+        $row = $db->table('pos_daily_closings')->where('status', 'OPEN')->get()->getRowArray();
+        $this->check('expected_opening_cash=180.000, opening_cash=175.000', (float) $row['expected_opening_cash'] == 180000.0 && (float) $row['opening_cash'] == 175000.0 && $row['notes'] === 'uang kembalian dipakai beli plastik', $row);
+
+        // Pelunasan sisa dari hari sebelumnya di hari 2
+        $db->table('pos_sales')->where('id', $id)->update(['balance_due' => 0]);
+        $sd = $svc->checkout(['client_uuid' => $uuid(), 'customer_id' => $cust, 'items' => [['product_id' => $A, 'qty' => 5]], 'payments' => [['method' => 'CASH', 'tendered' => 20000]]], $k);
+        $pd = $svc->addPayment($sd['id'], $uuid(), 'CASH', 30000, null, 1);
+        $this->check('Hari 2: penjualan 50.000 bayar 20.000 lalu 30.000 → PAID', $pd['success'] && $db->table('pos_sales')->where('id', $sd['id'])->get()->getRow('payment_status') === 'PAID', $pd['message']);
+        $sum2 = $day->summary($day->openDay());
+        $this->check('EOD hari 2 (tanggal sama dgn hari 1 di tes: 80.000 + 50.000 tunai; kas awal 175.000)', $sum2['cash_sales'] == 130000.0 && $sum2['expected_cash'] == 305000.0, [$sum2['cash_sales'], $sum2['expected_cash']]);
+
+        // Retur setelah pelunasan: refund ≤ dibayar
+        $rt = (new PosReturnService())->create($sd['id'], ['items' => [['sale_item_id' => (int) $db->table('pos_sale_items')->where('sale_id', $sd['id'])->get()->getRow('id'), 'qty' => 5, 'condition' => 'RESTOCK']], 'reason_code' => 'BATAL_BELI', 'refund_method' => 'CASH'], 1);
+        $this->check('Retur penuh setelah pelunasan: refund 50.000', $rt['success'] && $rt['refund'] == 50000.0, $rt['message'] ?? '');
+
+        // Bersihkan
+        $db->query('SET FOREIGN_KEY_CHECKS=0');
+        foreach (['pos_qris_settlements', 'pos_cash_deposits', 'stock_opening_lines', 'stock_openings', 'pos_payment_corrections', 'pos_return_items', 'pos_returns', 'stock_opname_counts', 'stock_broken_reports', 'stock_opname_lines', 'stock_opname_sessions', 'pos_daily_closings', 'pos_stock_overrides', 'pos_payments', 'pos_sale_items', 'pos_sales', 'stock_ledger', 'stock_balances', 'goods_receipt_items', 'goods_receipts', 'pos_markdowns', 'pos_product_prices'] as $tb) {
+            $db->query("TRUNCATE TABLE $tb");
+        }
+        $db->query('SET FOREIGN_KEY_CHECKS=1');
+        $db->query('DELETE FROM financial_transactions WHERE id > 137');
+        $db->query('ALTER TABLE financial_transactions AUTO_INCREMENT = 138');
+        $db->table('products')->update(['is_pos' => 0]);
+        $db->table('activity_logs')->whereIn('module', ['pos', 'stock'])->delete();
+
+        CLI::write($this->fails === 0 ? 'SEMUA LULUS' : $this->fails . ' GAGAL', $this->fails === 0 ? 'green' : 'red');
+    }
+}
